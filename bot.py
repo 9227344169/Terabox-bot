@@ -1,225 +1,215 @@
 import os
-import sqlite3
-import logging
+import re
 import asyncio
 from aiogram import Bot, Dispatcher, types
-from aiogram.contrib.middlewares.logging import LoggingMiddleware
-from aiogram.dispatcher.middlewares import BaseMiddleware
-from aiogram.dispatcher import FSMContext
-from aiogram.dispatcher.filters.state import State, StatesGroup
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.utils import executor
-from datetime import date
+from yt_dlp import YoutubeDL
 
-# ======= CONFIGURATION ==========
 BOT_TOKEN = os.getenv("BOT_TOKEN") or "7950519159:AAFJoYri3SImSjh43E4iXAQtWED0vl1IHhc"
-SUPER_VIP_ID = int(os.getenv("SUPER_VIP_ID") or 1669843747)
-DOWNLOAD_LIMIT_PER_DAY = 3
-# ================================
-
-logging.basicConfig(level=logging.INFO, filename="bot.log", format='%(asctime)s - %(levelname)s - %(message)s')
+ADMIN_ID = int(os.getenv("ADMIN_ID") or 1669843747)
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(bot)
-dp.middleware.setup(LoggingMiddleware())
 
-DB_FILE = "bot_data.db"
+# In-memory verified users list (should use DB for persistence)
+verified_users = set()
 
-def init_db():
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY,
-            vip INTEGER DEFAULT 0,
-            last_used TEXT,
-            usage_count INTEGER DEFAULT 0
-        )
-    ''')
-    conn.commit()
-    conn.close()
+# Regex patterns for supported platforms
+PLATFORM_PATTERNS = {
+    "youtube": re.compile(r"(youtu\.be|youtube\.com)"),
+    "instagram": re.compile(r"(instagram\.com)"),
+    "terabox": re.compile(r"(teraboxshare\.com|teraboxlink\.com|terabox\.com)"),
+    "twitter": re.compile(r"(twitter\.com|x\.com)"),
+    "snapchat": re.compile(r"(snapchat\.com)"),
+    "whatsapp": re.compile(r"(whatsapp\.com)"),
+    # Add more if needed
+}
 
-def set_vip(user_id: int, vip_status: int):
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute("INSERT OR REPLACE INTO users (user_id, vip) VALUES (?, ?)", (user_id, vip_status))
-    conn.commit()
-    conn.close()
+# YTDL options for audio/video extraction
+YTDL_OPTS_VIDEO = {
+    "format": "bestvideo+bestaudio/best",
+    "outtmpl": "%(id)s.%(ext)s",
+    "noplaylist": True,
+    "quiet": True,
+    "no_warnings": True,
+}
+YTDL_OPTS_AUDIO = {
+    "format": "bestaudio/best",
+    "outtmpl": "%(id)s.%(ext)s",
+    "quiet": True,
+    "no_warnings": True,
+    "postprocessors": [{
+        "key": "FFmpegExtractAudio",
+        "preferredcodec": "mp3",
+        "preferredquality": "192",
+    }],
+}
 
-def remove_vip(user_id: int):
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute("UPDATE users SET vip=0 WHERE user_id=?", (user_id,))
-    conn.commit()
-    conn.close()
+def detect_platform(url: str):
+    for name, pattern in PLATFORM_PATTERNS.items():
+        if pattern.search(url):
+            return name
+    return None
 
-def is_vip(user_id: int) -> bool:
-    if user_id == SUPER_VIP_ID:
-        return True
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute("SELECT vip FROM users WHERE user_id=?", (user_id,))
-    res = c.fetchone()
-    conn.close()
-    return res and res[0] == 1
+async def download_youtube(url: str, audio_only=False):
+    opts = YTDL_OPTS_AUDIO if audio_only else YTDL_OPTS_VIDEO
+    loop = asyncio.get_event_loop()
+    ytdl = YoutubeDL(opts)
+    data = await loop.run_in_executor(None, lambda: ytdl.extract_info(url, download=True))
+    filename = ytdl.prepare_filename(data)
+    return filename, data.get("title", "video")
 
-def get_usage(user_id: int):
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute("SELECT last_used, usage_count FROM users WHERE user_id=?", (user_id,))
-    res = c.fetchone()
-    conn.close()
-    if res:
-        return res[0], res[1]
-    return None, 0
-
-def update_usage(user_id: int):
-    today_str = date.today().strftime("%Y-%m-%d")
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    last_used, usage_count = get_usage(user_id)
-    if last_used == today_str:
-        usage_count += 1
-        c.execute("UPDATE users SET usage_count=? WHERE user_id=?", (usage_count, user_id))
-    else:
-        usage_count = 1
-        c.execute("INSERT OR REPLACE INTO users (user_id, last_used, usage_count) VALUES (?, ?, ?)", (user_id, today_str, usage_count))
-    conn.commit()
-    conn.close()
-
-def can_use(user_id: int) -> bool:
-    if user_id == SUPER_VIP_ID or is_vip(user_id):
-        return True
-    last_used, usage_count = get_usage(user_id)
-    today_str = date.today().strftime("%Y-%m-%d")
-    if last_used == today_str and usage_count >= DOWNLOAD_LIMIT_PER_DAY:
-        return False
-    return True
-
-class VIPManage(StatesGroup):
-    waiting_for_user_id = State()
-
-admin_buttons = InlineKeyboardMarkup(row_width=2)
-admin_buttons.add(
-    InlineKeyboardButton("➕ Add VIP", callback_data="vip_add"),
-    InlineKeyboardButton("➖ Remove VIP", callback_data="vip_remove"),
-    InlineKeyboardButton("📋 VIP List", callback_data="vip_list"),
-)
-
-@dp.message_handler(commands=['start'])
-async def cmd_start(message: types.Message):
-    await message.answer(
-        "👋 Welcome to the Terabox Video Downloader Bot!\n\n"
-        "Send me a Terabox video link and I'll fetch the video for you.\n"
-        f"⚠️ Normal users can download up to {DOWNLOAD_LIMIT_PER_DAY} times per day.\n"
-        "VIPs have unlimited access.\n\nUse /help to see commands."
-    )
-
-@dp.message_handler(commands=['help'])
-async def cmd_help(message: types.Message):
-    text = (
-        "🤖 *Commands:*\n"
-        "/start - Start the bot\n"
-        "/help - Show this help message\n"
-        "/stats - Your usage stats\n"
-    )
-    if message.from_user.id == SUPER_VIP_ID:
-        await message.answer(text + "\nAdmin commands below:", parse_mode="Markdown", reply_markup=admin_buttons)
-    else:
-        await message.answer(text, parse_mode="Markdown")
-
-@dp.callback_query_handler(lambda c: c.data and c.data.startswith('vip_'))
-async def process_admin_buttons(callback_query: types.CallbackQuery, state: FSMContext):
-    user_id = callback_query.from_user.id
-    action = callback_query.data
-
-    if user_id != SUPER_VIP_ID:
-        await callback_query.answer("❌ Not authorized.", show_alert=True)
-        return
-
-    if action == "vip_add" or action == "vip_remove":
-        await state.update_data(vip_action=action)
-        prompt_text = "Please send the user ID to *ADD* as VIP:" if action == "vip_add" else "Please send the user ID to *REMOVE* from VIP:"
-        await VIPManage.waiting_for_user_id.set()
-        await callback_query.message.answer(prompt_text, parse_mode="Markdown")
-        await callback_query.answer()
-    elif action == "vip_list":
-        conn = sqlite3.connect(DB_FILE)
-        c = conn.cursor()
-        c.execute("SELECT user_id FROM users WHERE vip=1")
-        vips = c.fetchall()
-        conn.close()
-        if not vips:
-            await callback_query.message.answer("No VIP users found.")
-        else:
-            vip_list = "\n".join(str(uid[0]) for uid in vips)
-            await callback_query.message.answer(f"👑 VIP Users:\n{vip_list}")
-        await callback_query.answer()
-
-@dp.message_handler(state=VIPManage.waiting_for_user_id)
-async def vip_manage_user_id_final(message: types.Message, state: FSMContext):
-    data = await state.get_data()
-    action = data.get('vip_action')
-    user_id_text = message.text.strip()
-
+async def send_file(chat_id, file_path, caption):
     try:
-        target_user_id = int(user_id_text)
-    except ValueError:
-        await message.reply("❌ Invalid user ID. Please send a numeric user ID.")
+        async with bot:
+            await bot.send_chat_action(chat_id, action=types.ChatActions.UPLOAD_DOCUMENT)
+            with open(file_path, "rb") as f:
+                await bot.send_document(chat_id, document=f, caption=caption)
+    finally:
+        try:
+            os.remove(file_path)
+        except Exception:
+            pass
+
+@dp.message_handler(commands=["start"])
+async def start_handler(message: types.Message):
+    await message.answer(
+        "👋 Welcome to Downloader Ai!\n\n"
+        "Send me any supported social media link and I'll help you download or watch it.\n"
+        "You must be verified by admin to use this bot.\n"
+        "Use /help to see commands."
+    )
+
+@dp.message_handler(commands=["help"])
+async def help_handler(message: types.Message):
+    kb = InlineKeyboardMarkup(row_width=2)
+    if message.from_user.id == ADMIN_ID:
+        kb.add(
+            InlineKeyboardButton("Verify User", callback_data="verify_user"),
+            InlineKeyboardButton("Remove User", callback_data="remove_user"),
+            InlineKeyboardButton("Verified List", callback_data="list_verified"),
+        )
+    await message.answer(
+        "🤖 Commands:\n"
+        "/start - Start the bot\n"
+        "/help - Show this help\n\n"
+        "Send any video/music link to download or watch.\n"
+        "Only verified users can use the bot.",
+        reply_markup=kb if kb.inline_keyboard else None,
+    )
+
+@dp.callback_query_handler(lambda c: c.data and c.data.startswith(("verify_user", "remove_user", "list_verified")))
+async def admin_buttons_handler(callback_query: types.CallbackQuery):
+    if callback_query.from_user.id != ADMIN_ID:
+        await callback_query.answer("Unauthorized", show_alert=True)
         return
 
-    if action == "vip_add":
-        set_vip(target_user_id, 1)
-        await message.reply(f"✅ User `{target_user_id}` has been *added* as VIP.", parse_mode="Markdown")
-    elif action == "vip_remove":
-        remove_vip(target_user_id)
-        await message.reply(f"✅ User `{target_user_id}` has been *removed* from VIP.", parse_mode="Markdown")
+    data = callback_query.data
+    if data == "verify_user":
+        await callback_query.message.answer("Send me the Telegram user ID to verify:")
+        await bot.answer_callback_query(callback_query.id)
+        dp.register_message_handler(verify_user_handler, state=None, content_types=types.ContentTypes.TEXT, chat_id=ADMIN_ID)
+    elif data == "remove_user":
+        await callback_query.message.answer("Send me the Telegram user ID to remove from verified:")
+        await bot.answer_callback_query(callback_query.id)
+        dp.register_message_handler(remove_user_handler, state=None, content_types=types.ContentTypes.TEXT, chat_id=ADMIN_ID)
+    elif data == "list_verified":
+        if verified_users:
+            verified_list = "\n".join(str(uid) for uid in verified_users)
+            await callback_query.message.answer(f"Verified users:\n{verified_list}")
+        else:
+            await callback_query.message.answer("No users verified yet.")
+        await bot.answer_callback_query(callback_query.id)
 
-    await state.finish()
+async def verify_user_handler(message: types.Message):
+    try:
+        user_id = int(message.text.strip())
+        if user_id in verified_users:
+            await message.answer(f"User {user_id} is already verified.")
+        else:
+            verified_users.add(user_id)
+            await message.answer(f"User {user_id} verified successfully!")
+    except ValueError:
+        await message.answer("Invalid user ID. Please send a numeric Telegram user ID.")
+    finally:
+        dp.message_handlers.unregister(verify_user_handler)
 
-@dp.message_handler(commands=['stats'])
-async def cmd_stats(message: types.Message):
-    user_id = message.from_user.id
-    last_used, usage_count = get_usage(user_id)
-    vip_status = "Yes" if is_vip(user_id) or user_id == SUPER_VIP_ID else "No"
-    last_used = last_used or "Never"
-    await message.answer(
-        f"👤 Your stats:\n"
-        f"VIP: {vip_status}\n"
-        f"Downloads today: {usage_count}\n"
-        f"Last used: {last_used}"
-    )
+async def remove_user_handler(message: types.Message):
+    try:
+        user_id = int(message.text.strip())
+        if user_id in verified_users:
+            verified_users.remove(user_id)
+            await message.answer(f"User {user_id} removed from verified list.")
+        else:
+            await message.answer(f"User {user_id} is not in the verified list.")
+    except ValueError:
+        await message.answer("Invalid user ID. Please send a numeric Telegram user ID.")
+    finally:
+        dp.message_handlers.unregister(remove_user_handler)
 
 @dp.message_handler()
-async def handle_message(message: types.Message):
+async def link_handler(message: types.Message):
     user_id = message.from_user.id
-    text = message.text.strip()
-
-    # Check if message looks like a Terabox link (simple check)
-    if "terabox.com" not in text.lower():
-        await message.reply("Please send a valid Terabox video link.")
+    if user_id != ADMIN_ID and user_id not in verified_users:
+        await message.answer("❌ You are not verified to use this bot. Please contact admin.")
         return
 
-    if not can_use(user_id):
-        await message.reply(f"❌ You reached your daily limit of {DOWNLOAD_LIMIT_PER_DAY} downloads.\nBecome VIP to get unlimited access!")
+    url = message.text.strip()
+    platform = detect_platform(url)
+    if not platform:
+        await message.answer("❌ Unsupported or invalid link.")
         return
 
-    # Here, insert your existing video fetch logic:
-    # For demo, just reply "Downloading video..."
-    await message.reply("⏳ Fetching video, please wait...")
+    # Inline buttons to choose Watch or Download
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        InlineKeyboardButton("Watch", callback_data=f"watch_{platform}|{url}"),
+        InlineKeyboardButton("Download", callback_data=f"download_{platform}|{url}"),
+    )
+    await message.answer(f"Detected platform: {platform.capitalize()}\nChoose action:", reply_markup=kb)
 
-    # Simulate video fetch with asyncio.sleep for demo only
-    await asyncio.sleep(2)
+@dp.callback_query_handler(lambda c: c.data and (c.data.startswith("watch_") or c.data.startswith("download_")))
+async def action_handler(callback_query: types.CallbackQuery):
+    user_id = callback_query.from_user.id
+    if user_id != ADMIN_ID and user_id not in verified_users:
+        await callback_query.answer("❌ You are not verified to use this bot.", show_alert=True)
+        return
 
-    # After video fetch (replace with real logic)
-    video_url = "https://example.com/fakevideo.mp4"  # replace with real video url
+    action, rest = callback_query.data.split("_", 1)
+    platform, url = rest.split("|", 1)
 
-    await message.reply(f"✅ Video ready: {video_url}")
+    await callback_query.answer("Processing, please wait...")
 
-    # Update usage count
-    update_usage(user_id)
+    if platform == "youtube":
+        try:
+            if action == "watch":
+                await callback_query.message.answer(f"Watch link: {url}\n(Open in your browser)")
+            else:  # download
+                filename, title = await download_youtube(url, audio_only=False)
+                await send_file(callback_query.message.chat.id, filename, caption=f"🎥 {title}")
+        except Exception as e:
+            await callback_query.message.answer(f"Error processing YouTube link: {e}")
 
-if __name__ == '__main__':
-    init_db()
-    print("Bot is starting...")
+    elif platform == "instagram":
+        await callback_query.message.answer("Instagram downloads coming soon!")
+
+    elif platform == "terabox":
+        # Placeholder: Terabox video downloader logic (implement your own scraper/API)
+        await callback_query.message.answer("Terabox downloader support coming soon!")
+
+    elif platform == "twitter":
+        await callback_query.message.answer("Twitter/X downloads coming soon!")
+
+    elif platform == "snapchat":
+        await callback_query.message.answer("Snapchat downloads coming soon!")
+
+    elif platform == "whatsapp":
+        await callback_query.message.answer("WhatsApp downloads coming soon!")
+
+    else:
+        await callback_query.message.answer("Unsupported platform.")
+
+if __name__ == "__main__":
+    print("Bot started...")
     executor.start_polling(dp, skip_updates=True)
