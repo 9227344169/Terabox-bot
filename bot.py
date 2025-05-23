@@ -2,28 +2,27 @@ import os
 import sqlite3
 import logging
 import asyncio
-import httpx
-from aiogram import Bot, Dispatcher, types, executor
+from aiogram import Bot, Dispatcher, types
 from aiogram.contrib.middlewares.logging import LoggingMiddleware
-from aiogram.utils.exceptions import Throttled
 from aiogram.dispatcher.middlewares import BaseMiddleware
-from aiogram.dispatcher.handler import CancelHandler
-from datetime import datetime, date
+from aiogram.dispatcher import FSMContext
+from aiogram.dispatcher.filters.state import State, StatesGroup
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.utils import executor
+from datetime import date
 
 # ======= CONFIGURATION ==========
-BOT_TOKEN = os.getenv("BOT_TOKEN") or "7788390714:AAFAnRw6HlPeZGHIFWhY_KsVLLm26dzFMW0"
-SUPER_VIP_IDS = [int(os.getenv("SUPER_VIP_ID") or 1669843747)]
+BOT_TOKEN = os.getenv("BOT_TOKEN") or "7950519159:AAFJoYri3SImSjh43E4iXAQtWED0vl1IHhc"
+SUPER_VIP_ID = int(os.getenv("SUPER_VIP_ID") or 1669843747)
+DOWNLOAD_LIMIT_PER_DAY = 3
 # ================================
 
-# Logging setup
 logging.basicConfig(level=logging.INFO, filename="bot.log", format='%(asctime)s - %(levelname)s - %(message)s')
 
-# Init bot
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(bot)
 dp.middleware.setup(LoggingMiddleware())
 
-# Database
 DB_FILE = "bot_data.db"
 
 def init_db():
@@ -33,7 +32,8 @@ def init_db():
         CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY,
             vip INTEGER DEFAULT 0,
-            last_used TEXT
+            last_used TEXT,
+            usage_count INTEGER DEFAULT 0
         )
     ''')
     conn.commit()
@@ -54,6 +54,8 @@ def remove_vip(user_id: int):
     conn.close()
 
 def is_vip(user_id: int) -> bool:
+    if user_id == SUPER_VIP_ID:
+        return True
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     c.execute("SELECT vip FROM users WHERE user_id=?", (user_id,))
@@ -61,144 +63,163 @@ def is_vip(user_id: int) -> bool:
     conn.close()
     return res and res[0] == 1
 
-def update_usage(user_id: int, date_str: str):
+def get_usage(user_id: int):
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
-    c.execute('''
-        INSERT INTO users (user_id, last_used) VALUES (?, ?)
-        ON CONFLICT(user_id) DO UPDATE SET last_used=excluded.last_used
-    ''', (user_id, date_str))
+    c.execute("SELECT last_used, usage_count FROM users WHERE user_id=?", (user_id,))
+    res = c.fetchone()
+    conn.close()
+    if res:
+        return res[0], res[1]
+    return None, 0
+
+def update_usage(user_id: int):
+    today_str = date.today().strftime("%Y-%m-%d")
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    last_used, usage_count = get_usage(user_id)
+    if last_used == today_str:
+        usage_count += 1
+        c.execute("UPDATE users SET usage_count=? WHERE user_id=?", (usage_count, user_id))
+    else:
+        usage_count = 1
+        c.execute("INSERT OR REPLACE INTO users (user_id, last_used, usage_count) VALUES (?, ?, ?)", (user_id, today_str, usage_count))
     conn.commit()
     conn.close()
 
-def get_last_usage(user_id: int):
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute("SELECT last_used FROM users WHERE user_id=?", (user_id,))
-    res = c.fetchone()
-    conn.close()
-    return res[0] if res else None
-
-# Cooldown middleware
-class ThrottlingMiddleware(BaseMiddleware):
-    def __init__(self, limit=1):
-        super().__init__()
-        self.rate_limit = limit
-        self.user_times = {}
-
-    async def on_process_message(self, message: types.Message, data: dict):
-        user_id = message.from_user.id
-        now = asyncio.get_event_loop().time()
-        if now - self.user_times.get(user_id, 0) < self.rate_limit:
-            raise Throttled(message, rate=self.rate_limit)
-        self.user_times[user_id] = now
-
-dp.middleware.setup(ThrottlingMiddleware(limit=1))
-
 def can_use(user_id: int) -> bool:
-    if user_id in SUPER_VIP_IDS or is_vip(user_id):
+    if user_id == SUPER_VIP_ID or is_vip(user_id):
         return True
-    last = get_last_usage(user_id)
-    if not last:
-        return True
-    return datetime.strptime(last, "%Y-%m-%d").date() < date.today()
+    last_used, usage_count = get_usage(user_id)
+    today_str = date.today().strftime("%Y-%m-%d")
+    if last_used == today_str and usage_count >= DOWNLOAD_LIMIT_PER_DAY:
+        return False
+    return True
 
-def set_used_today(user_id: int):
-    update_usage(user_id, date.today().strftime("%Y-%m-%d"))
+class VIPManage(StatesGroup):
+    waiting_for_user_id = State()
 
-async def fetch_terabox_video(link: str) -> str:
-    async with httpx.AsyncClient(timeout=15) as client:
-        response = await client.get(link)
-        if response.status_code == 200:
-            # Your actual video URL parsing logic here
-            return f"Fetched video URL for: {link}"
-        else:
-            raise Exception(f"Failed to fetch video, status code: {response.status_code}")
+admin_buttons = InlineKeyboardMarkup(row_width=2)
+admin_buttons.add(
+    InlineKeyboardButton("➕ Add VIP", callback_data="vip_add"),
+    InlineKeyboardButton("➖ Remove VIP", callback_data="vip_remove"),
+    InlineKeyboardButton("📋 VIP List", callback_data="vip_list"),
+)
 
 @dp.message_handler(commands=['start'])
 async def cmd_start(message: types.Message):
     await message.answer(
         "👋 Welcome to the Terabox Video Downloader Bot!\n\n"
         "Send me a Terabox video link and I'll fetch the video for you.\n"
-        "⚠️ Non-VIP users can download/view only once per day.\n"
+        f"⚠️ Normal users can download up to {DOWNLOAD_LIMIT_PER_DAY} times per day.\n"
         "VIPs have unlimited access.\n\nUse /help to see commands."
     )
 
 @dp.message_handler(commands=['help'])
 async def cmd_help(message: types.Message):
-    await message.answer(
+    text = (
         "🤖 *Commands:*\n"
-        "/start - Welcome\n"
-        "/help - Help\n"
-        "/vip_add <user_id> - Add VIP (Super VIP only)\n"
-        "/vip_remove <user_id> - Remove VIP (Super VIP only)\n"
-        "/vip_list - Show VIPs (Super VIP only)\n"
-        "/stats - Your usage stats",
-        parse_mode="Markdown"
+        "/start - Start the bot\n"
+        "/help - Show this help message\n"
+        "/stats - Your usage stats\n"
     )
+    if message.from_user.id == SUPER_VIP_ID:
+        await message.answer(text + "\nAdmin commands below:", parse_mode="Markdown", reply_markup=admin_buttons)
+    else:
+        await message.answer(text, parse_mode="Markdown")
 
-@dp.message_handler(commands=['vip_add'])
-async def cmd_vip_add(message: types.Message):
-    if message.from_user.id not in SUPER_VIP_IDS:
-        return await message.reply("❌ Not authorized.")
-    parts = message.text.split()
-    if len(parts) != 2 or not parts[1].isdigit():
-        return await message.reply("Usage: /vip_add <user_id>")
-    set_vip(int(parts[1]), 1)
-    await message.reply(f"✅ User {parts[1]} is now VIP.")
+@dp.callback_query_handler(lambda c: c.data and c.data.startswith('vip_'))
+async def process_admin_buttons(callback_query: types.CallbackQuery, state: FSMContext):
+    user_id = callback_query.from_user.id
+    action = callback_query.data
 
-@dp.message_handler(commands=['vip_remove'])
-async def cmd_vip_remove(message: types.Message):
-    if message.from_user.id not in SUPER_VIP_IDS:
-        return await message.reply("❌ Not authorized.")
-    parts = message.text.split()
-    if len(parts) != 2 or not parts[1].isdigit():
-        return await message.reply("Usage: /vip_remove <user_id>")
-    remove_vip(int(parts[1]))
-    await message.reply(f"✅ VIP removed from user {parts[1]}.")
+    if user_id != SUPER_VIP_ID:
+        await callback_query.answer("❌ Not authorized.", show_alert=True)
+        return
 
-@dp.message_handler(commands=['vip_list'])
-async def cmd_vip_list(message: types.Message):
-    if message.from_user.id not in SUPER_VIP_IDS:
-        return await message.reply("❌ Not authorized.")
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute("SELECT user_id FROM users WHERE vip=1")
-    vips = c.fetchall()
-    conn.close()
-    text = "👑 VIP Users:\n" + "\n".join(str(uid[0]) for uid in vips) if vips else "No VIPs found."
-    await message.reply(text)
+    if action == "vip_add" or action == "vip_remove":
+        await state.update_data(vip_action=action)
+        prompt_text = "Please send the user ID to *ADD* as VIP:" if action == "vip_add" else "Please send the user ID to *REMOVE* from VIP:"
+        await VIPManage.waiting_for_user_id.set()
+        await callback_query.message.answer(prompt_text, parse_mode="Markdown")
+        await callback_query.answer()
+    elif action == "vip_list":
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("SELECT user_id FROM users WHERE vip=1")
+        vips = c.fetchall()
+        conn.close()
+        if not vips:
+            await callback_query.message.answer("No VIP users found.")
+        else:
+            vip_list = "\n".join(str(uid[0]) for uid in vips)
+            await callback_query.message.answer(f"👑 VIP Users:\n{vip_list}")
+        await callback_query.answer()
+
+@dp.message_handler(state=VIPManage.waiting_for_user_id)
+async def vip_manage_user_id_final(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    action = data.get('vip_action')
+    user_id_text = message.text.strip()
+
+    try:
+        target_user_id = int(user_id_text)
+    except ValueError:
+        await message.reply("❌ Invalid user ID. Please send a numeric user ID.")
+        return
+
+    if action == "vip_add":
+        set_vip(target_user_id, 1)
+        await message.reply(f"✅ User `{target_user_id}` has been *added* as VIP.", parse_mode="Markdown")
+    elif action == "vip_remove":
+        remove_vip(target_user_id)
+        await message.reply(f"✅ User `{target_user_id}` has been *removed* from VIP.", parse_mode="Markdown")
+
+    await state.finish()
 
 @dp.message_handler(commands=['stats'])
 async def cmd_stats(message: types.Message):
-    uid = message.from_user.id
-    vip = "Yes" if uid in SUPER_VIP_IDS or is_vip(uid) else "No"
-    last = get_last_usage(uid) or "Never"
-    await message.reply(f"📊 Your Stats:\nID: {uid}\nVIP: {vip}\nLast Used: {last}")
+    user_id = message.from_user.id
+    last_used, usage_count = get_usage(user_id)
+    vip_status = "Yes" if is_vip(user_id) or user_id == SUPER_VIP_ID else "No"
+    last_used = last_used or "Never"
+    await message.answer(
+        f"👤 Your stats:\n"
+        f"VIP: {vip_status}\n"
+        f"Downloads today: {usage_count}\n"
+        f"Last used: {last_used}"
+    )
 
 @dp.message_handler()
-async def handle_links(message: types.Message):
-    uid = message.from_user.id
-    txt = message.text.strip()
+async def handle_message(message: types.Message):
+    user_id = message.from_user.id
+    text = message.text.strip()
 
-    if "terabox.com" not in txt:
-        return await message.reply("⚠️ Send a valid Terabox link.")
+    # Check if message looks like a Terabox link (simple check)
+    if "terabox.com" not in text.lower():
+        await message.reply("Please send a valid Terabox video link.")
+        return
 
-    if not can_use(uid):
-        return await message.reply("🚫 Daily limit reached. Contact admin for VIP access.")
+    if not can_use(user_id):
+        await message.reply(f"❌ You reached your daily limit of {DOWNLOAD_LIMIT_PER_DAY} downloads.\nBecome VIP to get unlimited access!")
+        return
 
-    try:
-        url = await fetch_terabox_video(txt)
-    except Exception as e:
-        logging.error(f"Fetch error for {uid}: {e}")
-        return await message.reply("❌ Failed to fetch video. Try again later.")
+    # Here, insert your existing video fetch logic:
+    # For demo, just reply "Downloading video..."
+    await message.reply("⏳ Fetching video, please wait...")
 
-    if uid not in SUPER_VIP_IDS and not is_vip(uid):
-        set_used_today(uid)
+    # Simulate video fetch with asyncio.sleep for demo only
+    await asyncio.sleep(2)
 
-    await message.reply(f"✅ Video fetched:\n{url}")
+    # After video fetch (replace with real logic)
+    video_url = "https://example.com/fakevideo.mp4"  # replace with real video url
+
+    await message.reply(f"✅ Video ready: {video_url}")
+
+    # Update usage count
+    update_usage(user_id)
 
 if __name__ == '__main__':
-    print("Starting bot...")
     init_db()
+    print("Bot is starting...")
     executor.start_polling(dp, skip_updates=True)
