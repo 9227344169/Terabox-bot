@@ -1,13 +1,12 @@
 services:
   - type: web
-    name: terabox-telegram-bot
+    name: terabox-bot
     env: python
-    repo: https://github.com/your-username/your-repo-name
-    branch: main
+    plan: free
     buildCommand: pip install -r requirements.txt
     startCommand: python bot.py
     envVars:
       - key: BOT_TOKEN
-        value: 7788390714:AAFAnRw6HlPeZGHIFWhY_KsVLLm26dzFMW0
+        value: 7950519159:AAFJoYri3SImSjh43E4iXAQtWED0vl1IHhc
       - key: SUPER_VIP_ID
         value: "1669843747"
