@@ -1,3 +1,6 @@
-python-telegram-bot==20.3
-aiohttp
+random
+asyncio
+httpx
 requests
+logging
+time
