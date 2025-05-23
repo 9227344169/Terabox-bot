@@ -1,7 +1,8 @@
+import os
 import sqlite3
 import logging
 import asyncio
-import httpx  # <- added
+import httpx
 from aiogram import Bot, Dispatcher, types, executor
 from aiogram.contrib.middlewares.logging import LoggingMiddleware
 from aiogram.utils.exceptions import Throttled
@@ -10,8 +11,8 @@ from aiogram.dispatcher.handler import CancelHandler
 from datetime import datetime, date
 
 # ======= CONFIGURATION ==========
-BOT_TOKEN = "7788390714:AAFAnRw6HlPeZGHIFWhY_KsVLLm26dzFMW0"  # <<< PUT YOUR BOT TOKEN HERE
-SUPER_VIP_IDS = [1669843747]       # <<< YOUR TELEGRAM USER ID HERE
+BOT_TOKEN = os.getenv("BOT_TOKEN") or "7788390714:AAFAnRw6HlPeZGHIFWhY_KsVLLm26dzFMW0"
+SUPER_VIP_IDS = [int(os.getenv("SUPER_VIP_ID") or 1669843747)]
 # ================================
 
 # Logging setup
@@ -63,7 +64,6 @@ def is_vip(user_id: int) -> bool:
 def update_usage(user_id: int, date_str: str):
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
-    # Insert or update last_used for existing or new users
     c.execute('''
         INSERT INTO users (user_id, last_used) VALUES (?, ?)
         ON CONFLICT(user_id) DO UPDATE SET last_used=excluded.last_used
@@ -106,13 +106,11 @@ def can_use(user_id: int) -> bool:
 def set_used_today(user_id: int):
     update_usage(user_id, date.today().strftime("%Y-%m-%d"))
 
-# Updated fetch function using httpx async client
 async def fetch_terabox_video(link: str) -> str:
     async with httpx.AsyncClient(timeout=15) as client:
         response = await client.get(link)
         if response.status_code == 200:
-            # Here you would parse the response content to get the actual video URL
-            # For demo purposes, just return the link itself or a mock URL
+            # Your actual video URL parsing logic here
             return f"Fetched video URL for: {link}"
         else:
             raise Exception(f"Failed to fetch video, status code: {response.status_code}")
